@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  tournament-app:
+    build: .
+    container_name: tournament-manager
+    ports:
+      - "3000:3000"
+    volumes:
+      # THE LIFELINE: Vi mappar mappen "prisma/data" på servern till "prisma/data" i containern.
+      # Detta gör att din SQLite-fil överlever när containern startas om!
+      - ./prisma/data:/app/prisma/data
+      - ./public/logos:/app/public/logos
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL="file:/app/prisma/data/prod.db"
+    restart: unless-stopped
