@@ -5,7 +5,7 @@ services:
     build: .
     container_name: tournament-manager
     ports:
-      - "3000:3000"
+      - "3005:3000"
     volumes:
       # THE LIFELINE: Vi mappar mappen "prisma/data" på servern till "prisma/data" i containern.
       # Detta gör att din SQLite-fil överlever när containern startas om!
