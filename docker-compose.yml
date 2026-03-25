@@ -1,17 +1,21 @@
 version: '3.8'
 
 services:
-  tournament-app:
-    build: .
-    container_name: tournament-manager
+  hq-app:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: tournament_manager
+    restart: unless-stopped
     ports:
-      - "3005:3000"
-    volumes:
-      # THE LIFELINE: Vi mappar mappen "prisma/data" på servern till "prisma/data" i containern.
-      # Detta gör att din SQLite-fil överlever när containern startas om!
-      - ./prisma/data:/app/prisma/data
-      - ./public/logos:/app/public/logos
+      - "3000:3000"
     environment:
       - NODE_ENV=production
-      - DATABASE_URL="file:/app/prisma/data/prod.db"
-    restart: unless-stopped
+      # Denna tvingar Prisma att läsa och skriva databasen i vår säkra volym
+      - DATABASE_URL=file:/app/data/prod.db
+    volumes:
+      # Mappar mappen 'data' på Linux-servern till '/app/data' i containern
+      - ./data:/app/data
+      # (Valfritt) Om du laddar upp egna loggor/pokaler som ska sparas över tid
+      - ./public/prices:/app/public/prices
+      - ./public/logos:/app/public/logos
