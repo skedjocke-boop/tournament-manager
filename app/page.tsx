@@ -1,13 +1,17 @@
 import { prisma } from '@/lib/prisma';
 import DashboardClient from '@/components/DashboardClient';
 
+// FIXEN: Tvingar Next.js att rendera sidan live vid varje sidladdning, 
+// istället för att försöka bygga den statiskt under Docker build-fasen.
+export const dynamic = 'force-dynamic';
+
 export default async function HQ() {
   const teamsData = await prisma.team.findMany({
     orderBy: { name: 'asc' },
     include: {
       homeMatches: { where: { status: 'COMPLETED' } },
       awayMatches: { where: { status: 'COMPLETED' } },
-      trophies: { include: { season: true } } // Vi behöver veta vilken säsong pokalen vanns
+      trophies: { include: { season: true } }
     }
   });
 

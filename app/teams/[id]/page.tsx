@@ -2,6 +2,9 @@ import { prisma } from '@/lib/prisma';
 import { notFound } from 'next/navigation';
 import TeamProfileClient from '@/components/TeamProfileClient';
 
+// FIXEN: Samma skydd här. Förhindrar static prerendering.
+export const dynamic = 'force-dynamic';
+
 export default async function TeamPage({ params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = await params;
   const teamId = resolvedParams.id;
@@ -11,7 +14,7 @@ export default async function TeamPage({ params }: { params: Promise<{ id: strin
     include: {
       homeMatches: { where: { status: 'COMPLETED' }, include: { homeTeam: true, awayTeam: true, season: true }, orderBy: { updatedAt: 'asc' } },
       awayMatches: { where: { status: 'COMPLETED' }, include: { homeTeam: true, awayTeam: true, season: true }, orderBy: { updatedAt: 'asc' } },
-      trophies: { include: { season: true } }, // Inkluderar säsongsnamnet
+      trophies: { include: { season: true } }, 
       seasonResults: { include: { season: true }, orderBy: { season: { createdAt: 'asc' } } }
     }
   });
@@ -22,7 +25,6 @@ export default async function TeamPage({ params }: { params: Promise<{ id: strin
   const allMatches = [...team.homeMatches, ...team.awayMatches].sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
   const currentSeasonMatches = allMatches.filter(m => m.seasonId === activeSeason?.id);
 
-  // Hjälpfunktion för att räkna stats (Används för både All-Time och Current Season)
   const calcStats = (matchesToCalc: typeof allMatches) => {
     let biggestWin = { margin: 0, match: null as any };
     let biggestLoss = { margin: 0, match: null as any };
@@ -67,7 +69,6 @@ export default async function TeamPage({ params }: { params: Promise<{ id: strin
   const allTimeStats = calcStats(allMatches);
   const currentSeasonStats = calcStats(currentSeasonMatches);
 
-  // -- THE HERITAGE CHART DATA (Säsong för Säsong) --
   const heritageData = [{ seasonName: 'Start', elo: 1000 }];
   team.seasonResults.forEach(sr => {
     heritageData.push({ seasonName: sr.season.name, elo: sr.finalElo });
@@ -76,7 +77,6 @@ export default async function TeamPage({ params }: { params: Promise<{ id: strin
     heritageData.push({ seasonName: `${activeSeason.name} (Live)`, elo: team.currentElo });
   }
 
-  // Denna säsongs formkurva
   const recentForm = currentSeasonMatches.slice(-5).map(m => {
     const isHome = m.homeTeamId === team.id;
     const won = isHome ? m.homeScore! > m.awayScore! : m.awayScore! > m.homeScore!;
