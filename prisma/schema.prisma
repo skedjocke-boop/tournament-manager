@@ -1,9 +1,3 @@
-// ------------------------------------------------------------------
-// DETTA ÄR ARKITEKTENS RITNING (SCHEMA.PRISMA)
-// Den pratar bara Prisma-språk och definierar strukturen.
-// Optimerad för Prisma v6.19.2 (LTS)
-// ------------------------------------------------------------------
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -13,101 +7,71 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// -----------------------------------------
-// CORE MODELS
-// -----------------------------------------
-
-model Team {
-  id             String   @id @default(uuid())
-  name           String   @unique
-  region         String   // "HSL" eller "ASL"
-  logoPath       String?  // Sökväg till den uppladdade loggan
-  primaryColor   String   @default("#374151")
-  secondaryColor String?
-  tertiaryColor  String?
-  
-  // Det globala, immutabla värdet
-  currentElo     Int      @default(1200)
-
-  // Relationer
-  homeMatches    Match[]  @relation("HomeTeam")
-  awayMatches    Match[]  @relation("AwayTeam")
-  trophies      Trophy[]
-  seasonResults SeasonResult[]
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+model Season {
+  id        String   @id @default(cuid())
+  name      String
+  startDate DateTime @default(now())
+  isActive  Boolean  @default(true)
+  phase     String   @default("PRE_SEASON")
+  matches   Match[]
+  trophies  Trophy[]
 }
 
-model Season {
-  id        String   @id @default(uuid())
-  name      String   // T.ex. "Säsong 1"
-  phase     String   // "PRE_SEASON", "REGULAR_SEASON", "PLAYOFFS", "ARCHIVED"
-  
-  // Relationer
-  matches   Match[]
-  trophies      Trophy[]
-  seasonResults SeasonResult[]
-  
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model Team {
+  id             String       @id @default(cuid())
+  name           String       @unique
+  division       String       @default("ELITSERIEN")
+  currentElo     Int          @default(1200)
+  peakElo        Int          @default(1200)
+  logoPath       String?
+  primaryColor   String       @default("#3b82f6")
+  secondaryColor String?
+  tertiaryColor  String?
+  isActive       Boolean      @default(true)
+  homeMatches    Match[]      @relation("HomeTeam")
+  awayMatches    Match[]      @relation("AwayTeam")
+  trophies       Trophy[]
+  eloHistory     EloHistory[]
 }
 
 model Match {
-  id          String   @id @default(uuid())
-  status      String   // "SCHEDULED", "LIVE", "COMPLETED"
-  round       Int      // Vilken omgång matchen tillhör (1-26)
-  
-  // Utfallet
-  homeScore   Int?
-  awayScore   Int?
-  isOvertime  Boolean  @default(false)
-  
-  // Kopplingar
+  id            String       @id @default(cuid())
+  seasonId      String
+  season        Season       @relation(fields: [seasonId], references: [id])
+  homeTeamId    String
+  homeTeam      Team         @relation("HomeTeam", fields: [homeTeamId], references: [id])
+  awayTeamId    String
+  awayTeam      Team         @relation("AwayTeam", fields: [awayTeamId], references: [id])
+  homePoints    Int?
+  awayPoints    Int?
+  isSuddenDeath Boolean      @default(false)
+  status        String       @default("SCHEDULED")
+  matchType     String       @default("REGULAR")
+  round         Int
+  playoffRound  String?
+  gameNumber    Int?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  eloHistory    EloHistory[]
+}
+
+model Trophy {
+  id          String   @id @default(cuid())
+  name        String
+  imageUrl    String
+  dateAwarded DateTime @default(now())
   seasonId    String
   season      Season   @relation(fields: [seasonId], references: [id])
-  
-  homeTeamId  String
-  homeTeam    Team     @relation("HomeTeam", fields: [homeTeamId], references: [id])
-  
-  awayTeamId  String
-  awayTeam    Team     @relation("AwayTeam", fields: [awayTeamId], references: [id])
-
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  // Nytt för Slutspelet
-  matchType         String   @default("REGULAR") // REGULAR, HSL_PLAYOFF, ASL_PLAYOFF, CL
-  playoffRound      String?  // QF, SF, FINAL
-  gameNumber        Int?     // 1, 2, eller 3
+  teamId      String
+  team        Team     @relation(fields: [teamId], references: [id])
 }
 
-// --- NYTT FÖR FAS 5: LEGACY & HISTORIK ---
-model Trophy {
+model EloHistory {
   id        String   @id @default(cuid())
-  name      String   // T.ex. "HSL Champions", "Champions League Winners"
-  type      String   // T.ex. "PLAYOFF_HSL", "CL", "REGULAR_HSL"
-  imagePath String?  // T.ex. "/prices/cl-trophy.png"
-  
-  seasonId  String
-  season    Season   @relation(fields: [seasonId], references: [id])
-  
   teamId    String
-  team      Team     @relation(fields: [teamId], references: [id])
-  
-  createdAt DateTime @default(now())
-}
-
-model SeasonResult {
-  id        String   @id @default(cuid())
-  finalElo  Int      // Lagets Elo när säsongen stängdes (för The Heritage-grafen)
-  
-  seasonId  String
-  season    Season   @relation(fields: [seasonId], references: [id])
-  
-  teamId    String
-  team      Team     @relation(fields: [teamId], references: [id])
-
-  createdAt DateTime @default(now())
-
-  @@unique([seasonId, teamId]) // Ett lag kan bara ha ett slutresultat per säsong
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  matchId   String
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  elo       Int
+  date      DateTime @default(now())
 }

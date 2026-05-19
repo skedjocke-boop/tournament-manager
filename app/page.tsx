@@ -1,67 +1,85 @@
-import { prisma } from '@/lib/prisma';
-import DashboardClient from '@/components/DashboardClient';
+import { Suspense } from "react";
+import prisma from "@/lib/prisma";
+import DashboardClient from "@/components/DashboardClient";
 
-// FIXEN: Tvingar Next.js att rendera sidan live vid varje sidladdning, 
-// istället för att försöka bygga den statiskt under Docker build-fasen.
 export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
-export default async function HQ() {
-  const teamsData = await prisma.team.findMany({
-    orderBy: { name: 'asc' },
-    include: {
-      homeMatches: { where: { status: 'COMPLETED' } },
-      awayMatches: { where: { status: 'COMPLETED' } },
-      trophies: { include: { season: true } }
+function calculateTeamStats(team: any, activeSeasonId: string) {
+  let played = 0, wins = 0, otWins = 0, losses = 0, otLosses = 0;
+  let goalsFor = 0, goalsAgainst = 0;
+
+  // Hämtar alla historiska matcher
+  const allCompletedMatches = [
+    ...team.homeMatches.map((m: any) => ({ ...m, isHome: true, oppTeam: m.awayTeam })),
+    ...team.awayMatches.map((m: any) => ({ ...m, isHome: false, oppTeam: m.homeTeam }))
+  ].filter(m => m.status === 'COMPLETED' && m.homePoints !== null && m.awayPoints !== null && m.oppTeam?.name !== 'TBD');
+
+  allCompletedMatches.sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+
+  // Form ska sparas över säsonger (baseras på de absolut senaste matcherna oavsett säsong)
+  const form: string[] = [];
+  allCompletedMatches.forEach(match => {
+    const teamPoints = match.isHome ? match.homePoints : match.awayPoints;
+    const oppPoints = match.isHome ? match.awayPoints : match.homePoints;
+    if (teamPoints > oppPoints) {
+        if (match.isSuddenDeath) form.push('OTW'); else form.push('W');
+    } else {
+        if (match.isSuddenDeath) form.push('OTL'); else form.push('L');
     }
   });
 
+  // FIX: LIGATABELLEN ska ENBART räkna poäng och matcher för den nuvarande aktiva säsongen
+  const currentSeasonLeagueMatches = allCompletedMatches.filter(m => m.matchType === 'REGULAR' && m.seasonId === activeSeasonId);
+  
+  currentSeasonLeagueMatches.forEach(match => {
+    played++;
+    const teamPoints = match.isHome ? match.homePoints : match.awayPoints;
+    const oppPoints = match.isHome ? match.awayPoints : match.homePoints;
+    goalsFor += teamPoints;
+    goalsAgainst += oppPoints;
+    if (teamPoints > oppPoints) {
+        if (match.isSuddenDeath) otWins++; else wins++;
+    } else {
+        if (match.isSuddenDeath) otLosses++; else losses++;
+    }
+  });
+
+  const points = (wins * 3) + (otWins * 2) + (otLosses * 1);
+  const goalDifference = goalsFor - goalsAgainst;
+
+  return { played, wins, otWins, losses, otLosses, goalsFor, goalsAgainst, goalDifference, points, cleanSheets: 0, form: form.slice(-5) };
+}
+
+export default async function Home() {
   const activeSeason = await prisma.season.findFirst({
-    where: { phase: { not: 'ARCHIVED' } },
-    orderBy: { createdAt: 'desc' },
+    where: { isActive: true },
     include: {
       matches: {
         include: { homeTeam: true, awayTeam: true },
-        orderBy: [{ round: 'asc' }, { gameNumber: 'asc' }]
+        orderBy: { createdAt: 'asc' } 
       }
     }
   });
 
-  const enrichedTeams = teamsData.map(team => {
-    const regularMatches = [...team.homeMatches, ...team.awayMatches]
-      .filter(m => m.matchType === 'REGULAR' && m.seasonId === activeSeason?.id)
-      .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
-
-    let points = 0, wins = 0, otWins = 0, losses = 0, otLosses = 0, goalsFor = 0, goalsAgainst = 0, cleanSheets = 0;
-    let form: ('W' | 'L' | 'OTW' | 'OTL')[] = [];
-
-    for (const match of regularMatches) {
-      const isHome = match.homeTeamId === team.id;
-      const myScore = isHome ? match.homeScore! : match.awayScore!;
-      const oppScore = isHome ? match.awayScore! : match.homeScore!;
-      const isOvertime = match.isOvertime;
-
-      goalsFor += myScore;
-      goalsAgainst += oppScore;
-      if (oppScore === 0) cleanSheets++;
-
-      if (myScore > oppScore) {
-        if (isOvertime) { otWins++; points += 2; form.push('OTW'); } 
-        else { wins++; points += 3; form.push('W'); }
-      } else {
-        if (isOvertime) { otLosses++; points += 1; form.push('OTL'); } 
-        else { losses++; points += 0; form.push('L'); }
-      }
+  const teamsData = await prisma.team.findMany({
+    orderBy: { name: 'asc' },
+    include: {
+      homeMatches: { where: { status: 'COMPLETED' }, include: { awayTeam: true, season: true } },
+      awayMatches: { where: { status: 'COMPLETED' }, include: { homeTeam: true, season: true } },
+      trophies: { include: { season: true } },
     }
-
-    return {
-      ...team,
-      stats: { played: wins + otWins + losses + otLosses, wins, otWins, losses, otLosses, goalsFor, goalsAgainst, goalDifference: goalsFor - goalsAgainst, points, form: form.slice(-5), cleanSheets }
-    };
   });
 
-  const seasonMatches = activeSeason?.matches || [];
-  const currentPhase = activeSeason?.phase || 'PRE_SEASON';
-  const currentSeasonName = activeSeason?.name || 'Säsong 1';
+  const initialTeams = teamsData.map(team => {
+    return { ...team, stats: calculateTeamStats(team, activeSeason?.id || '') };
+  });
 
-  return <DashboardClient initialTeams={enrichedTeams} matches={seasonMatches} seasonPhase={currentPhase} seasonName={currentSeasonName} />;
+  return (
+    <main className="min-h-screen bg-slate-950 text-slate-200">
+      <Suspense fallback={<div className="p-8 text-center text-slate-500 font-bold uppercase tracking-widest animate-pulse mt-20">Laddar The Ritual Room...</div>}>
+        <DashboardClient initialTeams={initialTeams} initialMatches={activeSeason?.matches || []} activeSeason={activeSeason} />
+      </Suspense>
+    </main>
+  );
 }

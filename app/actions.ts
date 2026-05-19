@@ -1,380 +1,404 @@
-'use server';
+'use server'
 
-import { prisma } from '@/lib/prisma';
-import { revalidatePath } from 'next/cache';
+import { revalidatePath } from 'next/cache'
+import prisma from '@/lib/prisma'
 
-// --- HJÄLPARE: Hämta Grundseriens Tabell för Seeding ---
-async function getStandings(seasonId: string) {
-  const teamsData = await prisma.team.findMany({
-    include: {
-      homeMatches: { where: { status: 'COMPLETED', matchType: 'REGULAR', seasonId } },
-      awayMatches: { where: { status: 'COMPLETED', matchType: 'REGULAR', seasonId } }
-    }
-  });
-
-  const enrichedTeams = teamsData.map(team => {
-    let points = 0, goalsFor = 0, goalsAgainst = 0;
-    for (const m of [...team.homeMatches, ...team.awayMatches]) {
-      const isHome = m.homeTeamId === team.id;
-      const myScore = isHome ? m.homeScore! : m.awayScore!;
-      const oppScore = isHome ? m.awayScore! : m.homeScore!;
-      goalsFor += myScore; goalsAgainst += oppScore;
-      if (myScore > oppScore) points += m.isOvertime ? 2 : 3;
-      else points += m.isOvertime ? 1 : 0;
-    }
-    return { ...team, points, goalDifference: goalsFor - goalsAgainst, goalsFor };
-  });
-
-  const sortFn = (a: any, b: any) => {
-    if (b.points !== a.points) return b.points - a.points;
-    if (b.goalDifference !== a.goalDifference) return b.goalDifference - a.goalDifference;
-    return b.goalsFor - a.goalsFor;
-  };
-
-  return {
-    hsl: enrichedTeams.filter(t => t.region === 'HSL').sort(sortFn),
-    asl: enrichedTeams.filter(t => t.region === 'ASL').sort(sortFn),
-    all: enrichedTeams.sort(sortFn)
-  };
+export async function getDashboardData() {
+  const currentSeason = await prisma.season.findFirst({ where: { isActive: true } })
+  if (!currentSeason) return { matches: [] }
+  const allMatches = await prisma.match.findMany({
+    where: { seasonId: currentSeason.id },
+    include: { homeTeam: true, awayTeam: true },
+    orderBy: { createdAt: 'asc' } 
+  })
+  return { season: currentSeason, matches: allMatches }
 }
 
-export async function generateSchedule() {
-  const teams = await prisma.team.findMany();
-  if (teams.length !== 28) throw new Error("Måste finnas exakt 28 lag.");
+export async function updateTeamIdentity(teamId: string, primaryColor: string, logoPath: string) {
+    await prisma.team.update({
+        where: { id: teamId },
+        data: { primaryColor, logoPath: logoPath.trim() !== '' ? logoPath : null }
+    });
+    revalidatePath('/');
+    revalidatePath(`/teams/${teamId}`);
+    return { success: true };
+}
 
-  let season = await prisma.season.findFirst({ where: { phase: 'PRE_SEASON' } });
-  if (season) season = await prisma.season.update({ where: { id: season.id }, data: { phase: 'REGULAR_SEASON' } });
-  else season = await prisma.season.create({ data: { name: 'Säsong 1', phase: 'REGULAR_SEASON' } });
+async function checkAndAdvanceTournament(match: any, seasonId: string) {
+    if (match.matchType !== 'CL' && match.matchType !== 'PLAYOFF' && match.matchType !== 'QUALIFIER' && match.matchType !== 'BOTTOM_BATTLE') return;
 
-  const existingMatches = await prisma.match.count({ where: { seasonId: season.id } });
-  if (existingMatches > 0) return;
+    const legs = await prisma.match.findMany({ where: { seasonId, matchType: match.matchType, playoffRound: match.playoffRound, round: match.round } });
+    let teamA = legs[0].homeTeamId;
+    let teamB = legs[0].awayTeamId;
+    if (teamA === 'TBD' || teamB === 'TBD') teamA = legs[0].homeTeamId !== 'TBD' ? legs[0].homeTeamId : legs[0].awayTeamId;
 
-  const hslTeams = teams.filter(t => t.region === 'HSL');
-  const aslTeams = teams.filter(t => t.region === 'ASL');
+    const isBestOf5 = match.matchType === 'PLAYOFF' || match.matchType === 'QUALIFIER' || match.matchType === 'BOTTOM_BATTLE' || (match.matchType === 'CL' && match.playoffRound === 'FINAL');
+    let winnerId = null;
+    let isSeriesFinished = false;
 
-  const createLeagueSchedule = async (leagueTeams: typeof teams) => {
-    const n = leagueTeams.length;
-    const rounds = n - 1;
-    let matchesData = [];
+    if (isBestOf5) {
+        let winsA = 0, winsB = 0;
+        legs.filter(l => l.status === 'COMPLETED').forEach(l => {
+            const aWon = l.homeTeamId === teamA ? l.homePoints! > l.awayPoints! : l.awayPoints! > l.homePoints!;
+            if (aWon) winsA++; else winsB++;
+        });
 
-    for (let round = 0; round < rounds * 2; round++) {
-      const isReturnMatch = round >= rounds;
-      const actualRound = round % rounds;
+        if (winsA >= 3 || winsB >= 3) {
+            winnerId = winsA >= 3 ? teamA : teamB;
+            isSeriesFinished = true;
+            await prisma.match.updateMany({
+                where: { seasonId, matchType: match.matchType, playoffRound: match.playoffRound, round: match.round, status: 'SCHEDULED' },
+                data: { status: 'CANCELLED' }
+            });
+        }
+    } else {
+        const allCompleted = legs.every(m => m.status === 'COMPLETED');
+        if (allCompleted) {
+            isSeriesFinished = true;
+            let aPoints = 0, bPoints = 0;
+            legs.forEach(l => {
+                if (l.homeTeamId === teamA) { aPoints += (l.homePoints || 0); bPoints += (l.awayPoints || 0); }
+                else { aPoints += (l.awayPoints || 0); bPoints += (l.homePoints || 0); }
+            });
+            if (bPoints > aPoints) winnerId = teamB;
+            else if (bPoints === aPoints) {
+                const lastLeg = legs.sort((a,b) => (b.gameNumber || 0) - (a.gameNumber || 0))[0];
+                if (lastLeg.isSuddenDeath) winnerId = lastLeg.homePoints! > lastLeg.awayPoints! ? lastLeg.homeTeamId : lastLeg.awayTeamId;
+                else winnerId = teamA; 
+            } else winnerId = teamA;
+        }
+    }
 
-      for (let i = 0; i < n / 2; i++) {
-        const homeIdx = (actualRound + i) % (n - 1);
-        let awayIdx = (n - 1 - i + actualRound) % (n - 1);
-        if (i === 0) awayIdx = n - 1;
+    if (isSeriesFinished && winnerId && (match.matchType === 'CL' || match.matchType === 'PLAYOFF')) {
+        const tournamentRounds = match.matchType === 'CL' ? ['RO32', 'RO16', 'QF', 'SF', 'FINAL'] : ['QF', 'SF', 'FINAL'];
+        const currentIndex = tournamentRounds.indexOf(match.playoffRound!);
+        if (currentIndex === -1 || currentIndex === tournamentRounds.length - 1) return; 
 
-        let homeTeam = leagueTeams[homeIdx];
-        let awayTeam = leagueTeams[awayIdx];
+        const nextRound = tournamentRounds[currentIndex + 1];
+        const nextSlot = Math.ceil(match.round / 2);
+        const isTeamAInNextSlot = match.round % 2 !== 0; 
 
-        if (isReturnMatch || (i === 0 && actualRound % 2 === 1)) {
-          const temp = homeTeam; homeTeam = awayTeam; awayTeam = temp;
+        const nextMatches = await prisma.match.findMany({ where: { seasonId, matchType: match.matchType, playoffRound: nextRound, round: nextSlot } });
+
+        if (nextMatches.length > 0) {
+            const tbdTeam = await prisma.team.findFirst({ where: { name: 'TBD' } });
+            
+            const leg1 = nextMatches.find(m => m.gameNumber === 1) || nextMatches[0];
+            let baseTeamA = leg1.homeTeamId;
+            let baseTeamB = leg1.awayTeamId;
+
+            if (isTeamAInNextSlot) baseTeamA = winnerId;
+            else baseTeamB = winnerId;
+
+            if (baseTeamA !== tbdTeam?.id && baseTeamB !== tbdTeam?.id) {
+                const t1 = await prisma.team.findUnique({where:{id:baseTeamA}});
+                const t2 = await prisma.team.findUnique({where:{id:baseTeamB}});
+                if (t1 && t2 && t1.currentElo < t2.currentElo) { 
+                    const temp = baseTeamA; baseTeamA = baseTeamB; baseTeamB = temp; 
+                }
+            }
+
+            for (const m of nextMatches) {
+                let finalHome = baseTeamA;
+                let finalAway = baseTeamB;
+                
+                const isBestOf5Next = match.matchType === 'PLAYOFF' || (match.matchType === 'CL' && nextRound === 'FINAL');
+                if (isBestOf5Next) {
+                    if (m.gameNumber === 3 || m.gameNumber === 4) { finalHome = baseTeamB; finalAway = baseTeamA; }
+                } else {
+                    if ((m.gameNumber || 1) % 2 === 0) { finalHome = baseTeamB; finalAway = baseTeamA; }
+                }
+
+                await prisma.match.update({ where: { id: m.id }, data: { homeTeamId: finalHome, awayTeamId: finalAway } });
+            }
+        }
+    }
+}
+
+export async function saveMatch(matchId: string, homePoints: number, awayPoints: number, isSuddenDeath: boolean) {
+  if (homePoints === awayPoints) throw new Error("En match kan inte sluta oavgjort. Ge Sudden Death poängen till vinnaren.");
+
+  const match = await prisma.match.findUnique({ where: { id: matchId }, include: { homeTeam: true, awayTeam: true } })
+  if (!match || match.status === 'COMPLETED' || match.status === 'CANCELLED') throw new Error("Match hittades inte eller är redan avklarad")
+
+  const K = 32
+  const homeExpected = 1 / (1 + Math.pow(10, (match.awayTeam.currentElo - match.homeTeam.currentElo) / 400))
+  const awayExpected = 1 / (1 + Math.pow(10, (match.homeTeam.currentElo - match.awayTeam.currentElo) / 400))
+
+  const homeWon = homePoints > awayPoints
+  const homeActual = homeWon ? 1 : 0
+  const awayActual = homeWon ? 0 : 1
+  const margin = Math.abs(homePoints - awayPoints)
+  const marginMultiplier = isSuddenDeath ? 1 : Math.max(1, Math.log10(margin + 1))
+
+  const newHomeElo = Math.round(match.homeTeam.currentElo + K * marginMultiplier * (homeActual - homeExpected))
+  const newAwayElo = Math.round(match.awayTeam.currentElo + K * marginMultiplier * (awayActual - awayExpected))
+
+  const updatedMatch = await prisma.$transaction(async (tx) => {
+    const updated = await tx.match.update({ where: { id: matchId }, data: { homePoints, awayPoints, isSuddenDeath, status: 'COMPLETED' } });
+    
+    if (match.homeTeam.name !== 'TBD') {
+        const homePeak = Math.max(match.homeTeam.peakElo || 1200, newHomeElo);
+        await tx.team.update({ where: { id: match.homeTeamId }, data: { currentElo: newHomeElo, peakElo: homePeak } });
+        await tx.eloHistory.create({ data: { teamId: match.homeTeamId, matchId: match.id, elo: newHomeElo }});
+    }
+    
+    if (match.awayTeam.name !== 'TBD') {
+        const awayPeak = Math.max(match.awayTeam.peakElo || 1200, newAwayElo);
+        await tx.team.update({ where: { id: match.awayTeamId }, data: { currentElo: newAwayElo, peakElo: awayPeak } });
+        await tx.eloHistory.create({ data: { teamId: match.awayTeamId, matchId: match.id, elo: newAwayElo }});
+    }
+    return updated;
+  });
+
+  await checkAndAdvanceTournament(updatedMatch, updatedMatch.seasonId);
+  revalidatePath('/')
+  return { success: true }
+}
+
+export async function updateSeasonPhase(seasonId: string, newPhase: string) {
+  await prisma.season.update({ where: { id: seasonId }, data: { phase: newPhase } })
+  revalidatePath('/')
+}
+
+async function getCalculatedTables(seasonId: string) {
+    const allTeams = await prisma.team.findMany({ 
+        where: { isActive: true, name: { not: 'TBD' } },
+        include: { homeMatches: { where: { seasonId, matchType: 'REGULAR', status: 'COMPLETED' } }, awayMatches: { where: { seasonId, matchType: 'REGULAR', status: 'COMPLETED' } } }
+    });
+
+    const calculatedTeams = allTeams.map(t => {
+        let wins = 0, otWins = 0, losses = 0, otLosses = 0, goalsFor = 0, goalsAgainst = 0;
+        const matches = [...t.homeMatches.map(m=>({...m, isHome:true})), ...t.awayMatches.map(m=>({...m, isHome:false}))];
+        matches.forEach(m => {
+            const teamPoints = m.isHome ? m.homePoints! : m.awayPoints!;
+            const oppPoints = m.isHome ? m.awayPoints! : m.homePoints!;
+            goalsFor += teamPoints; goalsAgainst += oppPoints;
+            if (teamPoints > oppPoints) { if (m.isSuddenDeath) otWins++; else wins++; } else { if (m.isSuddenDeath) otLosses++; else losses++; }
+        });
+        const points = (wins * 3) + (otWins * 2) + (otLosses * 1);
+        return { ...t, stats: { points, goalDifference: goalsFor - goalsAgainst, goalsFor } };
+    });
+
+    const sortFn = (a:any, b:any) => {
+        if (b.stats.points !== a.stats.points) return b.stats.points - a.stats.points;
+        if (b.stats.goalDifference !== a.stats.goalDifference) return b.stats.goalDifference - a.stats.goalDifference;
+        if (b.stats.goalsFor !== a.stats.goalsFor) return b.stats.goalsFor - a.stats.goalsFor;
+        return b.currentElo - a.currentElo;
+    };
+
+    return { elit: calculatedTeams.filter(t => t.division === 'ELITSERIEN').sort(sortFn), superettan: calculatedTeams.filter(t => t.division === 'SUPERETTAN').sort(sortFn) };
+}
+
+function getBo5WinnerAndLoser(matches: any[]) {
+    let teamA = matches[0].homeTeamId, teamB = matches[0].awayTeamId;
+    let winsA = 0, winsB = 0;
+    matches.filter(m => m.status === 'COMPLETED').forEach(m => {
+        const aWon = m.homeTeamId === teamA ? m.homePoints! > m.awayPoints! : m.awayPoints! > m.homePoints!;
+        if (aWon) winsA++; else winsB++;
+    });
+    if (winsA >= 3) return { winner: teamA, loser: teamB };
+    if (winsB >= 3) return { winner: teamB, loser: teamA };
+    return null;
+}
+
+export async function triggerAwardCeremony(seasonId: string) {
+    const existingTrophies = await prisma.trophy.count({ where: { seasonId }});
+    if (existingTrophies > 0) throw new Error("Priser har redan delats ut för denna säsong.");
+
+    const { elit, superettan } = await getCalculatedTables(seasonId);
+    if (!elit[0] || !superettan[0]) throw new Error("Kunde inte kalkylera tabellen.");
+
+    const trophiesToCreate: any[] = [];
+    const elitserienWinnerId = elit[0].id;
+
+    const playoffFinals = await prisma.match.findMany({ where: { seasonId, matchType: 'PLAYOFF', playoffRound: 'FINAL' }});
+    const playoffResult = getBo5WinnerAndLoser(playoffFinals);
+    const playoffWinnerId = playoffResult?.winner;
+
+    const clFinals = await prisma.match.findMany({ where: { seasonId, matchType: 'CL', playoffRound: 'FINAL' }});
+    const clResult = getBo5WinnerAndLoser(clFinals);
+    const clWinnerId = clResult?.winner;
+
+    // --- RÄTTA POKAL-NAMN ---
+    if (elitserienWinnerId === playoffWinnerId && playoffWinnerId === clWinnerId) {
+        trophiesToCreate.push({ seasonId, teamId: elitserienWinnerId, name: 'THE TRI-FECTA', imageUrl: '/prices/TRItrophy.png' });
+    }
+
+    if (clWinnerId) {
+        trophiesToCreate.push({ seasonId, teamId: clWinnerId, name: 'Champions League Vinnare', imageUrl: '/prices/CLtrophy.png' });
+    }
+
+    if (playoffWinnerId) {
+        trophiesToCreate.push({ seasonId, teamId: playoffWinnerId, name: 'Världsmästare', imageUrl: '/prices/WCtrophy.png' });
+    }
+
+    trophiesToCreate.push({ seasonId, teamId: elitserienWinnerId, name: 'Vinnare Elitserien', imageUrl: '/prices/elitserien.png' });
+    trophiesToCreate.push({ seasonId, teamId: superettan[0].id, name: 'Vinnare Superettan', imageUrl: '/prices/superettan.png' });
+
+    const bottenFinals = await prisma.match.findMany({ where: { seasonId, matchType: 'BOTTOM_BATTLE' }});
+    const bottenResult = getBo5WinnerAndLoser(bottenFinals);
+    if (bottenResult?.loser) {
+        trophiesToCreate.push({ seasonId, teamId: bottenResult.loser, name: 'Sämst', imageUrl: '/prices/looser.png' });
+    }
+
+    await prisma.trophy.createMany({ data: trophiesToCreate });
+    await prisma.season.update({ where: { id: seasonId }, data: { phase: 'OFF_SEASON' }});
+    revalidatePath('/');
+    return { success: true };
+}
+
+export async function startNextSeason(oldSeasonId: string) {
+    const { elit, superettan } = await getCalculatedTables(oldSeasonId);
+
+    const relegatedDirect = elit[13].id; 
+    const promotedDirect = superettan[0].id; 
+
+    const kval1Matches = await prisma.match.findMany({ where: { seasonId: oldSeasonId, matchType: 'QUALIFIER', playoffRound: 'KVAL_1' }});
+    const kval1Res = getBo5WinnerAndLoser(kval1Matches);
+    const kval2Matches = await prisma.match.findMany({ where: { seasonId: oldSeasonId, matchType: 'QUALIFIER', playoffRound: 'KVAL_2' }});
+    const kval2Res = getBo5WinnerAndLoser(kval2Matches);
+
+    await prisma.$transaction(async (tx) => {
+        await tx.team.update({ where: { id: relegatedDirect }, data: { division: 'SUPERETTAN' }});
+        await tx.team.update({ where: { id: promotedDirect }, data: { division: 'ELITSERIEN' }});
+        if (kval1Res) {
+            await tx.team.update({ where: { id: kval1Res.winner }, data: { division: 'ELITSERIEN' }});
+            await tx.team.update({ where: { id: kval1Res.loser }, data: { division: 'SUPERETTAN' }});
+        }
+        if (kval2Res) {
+            await tx.team.update({ where: { id: kval2Res.winner }, data: { division: 'ELITSERIEN' }});
+            await tx.team.update({ where: { id: kval2Res.loser }, data: { division: 'SUPERETTAN' }});
         }
 
-        matchesData.push({
-          seasonId: season!.id, homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
-          round: round + 1, status: 'SCHEDULED', isOvertime: false, matchType: 'REGULAR'
-        });
-      }
-    }
-    return matchesData;
-  };
-
-  await prisma.match.createMany({ data: [...await createLeagueSchedule(hslTeams), ...await createLeagueSchedule(aslTeams)] });
-  revalidatePath('/');
-}
-
-export async function saveMatchResult(matchId: string, homeScore: number, awayScore: number, isOvertime: boolean) {
-  const match = await prisma.match.findUnique({ where: { id: matchId }, include: { homeTeam: true, awayTeam: true } });
-  if (!match || match.status === 'COMPLETED') return;
-
-  const K = 24;
-  const homeWon = homeScore > awayScore;
-  const expectedHome = 1 / (1 + Math.pow(10, (match.awayTeam.currentElo - match.homeTeam.currentElo) / 400));
-  const expectedAway = 1 / (1 + Math.pow(10, (match.homeTeam.currentElo - match.awayTeam.currentElo) / 400));
-  const actualHome = homeWon ? 1 : 0;
-  const actualAway = homeWon ? 0 : 1;
-
-  let homeEloChange = Math.round(K * (actualHome - expectedHome));
-  let awayEloChange = Math.round(K * (actualAway - expectedAway));
-
-  if (homeEloChange < 0 && match.homeTeam.currentElo + homeEloChange < 0) {
-    homeEloChange = -match.homeTeam.currentElo; awayEloChange = Math.abs(homeEloChange);
-  } else if (awayEloChange < 0 && match.awayTeam.currentElo + awayEloChange < 0) {
-    awayEloChange = -match.awayTeam.currentElo; homeEloChange = Math.abs(awayEloChange);
-  }
-
-  await prisma.$transaction([
-    prisma.match.update({ where: { id: matchId }, data: { status: 'COMPLETED', homeScore, awayScore, isOvertime } }),
-    prisma.team.update({ where: { id: match.homeTeamId }, data: { currentElo: match.homeTeam.currentElo + homeEloChange } }),
-    prisma.team.update({ where: { id: match.awayTeamId }, data: { currentElo: match.awayTeam.currentElo + awayEloChange } })
-  ]);
-  revalidatePath('/');
-}
-
-export async function initiatePlayoffs() {
-  const season = await prisma.season.findFirst({ where: { phase: 'REGULAR_SEASON' } });
-  if (!season) return;
-
-  const standings = await getStandings(season.id);
-  const playoffMatches: any[] = [];
-  
-  const createMatch = (home: any, away: any, matchType: string, playoffRound: string, gameNumber: number, roundNum: number) => {
-    if(!home || !away) return;
-    playoffMatches.push({ seasonId: season.id, homeTeamId: home.id, awayTeamId: away.id, status: 'SCHEDULED', matchType, playoffRound, gameNumber, round: roundNum, isOvertime: false });
-  };
-
-  createMatch(standings.hsl[0], standings.hsl[7], 'HSL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.hsl[3], standings.hsl[4], 'HSL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.hsl[2], standings.hsl[5], 'HSL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.hsl[1], standings.hsl[6], 'HSL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.asl[0], standings.asl[7], 'ASL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.asl[3], standings.asl[4], 'ASL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.asl[2], standings.asl[5], 'ASL_PLAYOFF', 'QF', 1, 1);
-  createMatch(standings.asl[1], standings.asl[6], 'ASL_PLAYOFF', 'QF', 1, 1);
-
-  createMatch(standings.hsl[0], standings.asl[3], 'CHAMPIONS_LEAGUE', 'QF', 1, 2);
-  createMatch(standings.asl[1], standings.hsl[2], 'CHAMPIONS_LEAGUE', 'QF', 1, 2);
-  createMatch(standings.asl[0], standings.hsl[3], 'CHAMPIONS_LEAGUE', 'QF', 1, 2);
-  createMatch(standings.hsl[1], standings.asl[2], 'CHAMPIONS_LEAGUE', 'QF', 1, 2);
-
-  createMatch(standings.hsl[7], standings.hsl[0], 'HSL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.hsl[4], standings.hsl[3], 'HSL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.hsl[5], standings.hsl[2], 'HSL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.hsl[6], standings.hsl[1], 'HSL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.asl[7], standings.asl[0], 'ASL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.asl[4], standings.asl[3], 'ASL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.asl[5], standings.asl[2], 'ASL_PLAYOFF', 'QF', 2, 3);
-  createMatch(standings.asl[6], standings.asl[1], 'ASL_PLAYOFF', 'QF', 2, 3);
-
-  createMatch(standings.asl[3], standings.hsl[0], 'CHAMPIONS_LEAGUE', 'QF', 2, 4);
-  createMatch(standings.hsl[2], standings.asl[1], 'CHAMPIONS_LEAGUE', 'QF', 2, 4);
-  createMatch(standings.hsl[3], standings.asl[0], 'CHAMPIONS_LEAGUE', 'QF', 2, 4);
-  createMatch(standings.asl[2], standings.hsl[1], 'CHAMPIONS_LEAGUE', 'QF', 2, 4);
-
-  await prisma.season.update({ where: { id: season.id }, data: { phase: 'PLAYOFFS' } });
-  await prisma.match.createMany({ data: playoffMatches });
-  revalidatePath('/');
-}
-
-export async function advancePlayoffs() {
-  const season = await prisma.season.findFirst({ where: { phase: 'PLAYOFFS' } });
-  if (!season) return;
-
-  const playoffMatches = await prisma.match.findMany({ where: { seasonId: season.id, matchType: { not: 'REGULAR' } } });
-  if (playoffMatches.filter(m => m.status === 'SCHEDULED').length > 0) return;
-
-  let currentStage = 'QF';
-  if (playoffMatches.some(m => m.playoffRound === 'FINAL')) currentStage = 'FINAL';
-  else if (playoffMatches.some(m => m.playoffRound === 'SF')) currentStage = 'SF';
-
-  const stageMatches = playoffMatches.filter(m => m.playoffRound === currentStage);
-  
-  const seriesMap = new Map();
-  for (const m of stageMatches) {
-    const pair = [m.homeTeamId, m.awayTeamId].sort().join('_');
-    if (!seriesMap.has(pair)) seriesMap.set(pair, { matches: [], matchType: m.matchType });
-    if (m.gameNumber === 1) { 
-      seriesMap.get(pair).highSeedId = m.homeTeamId;
-      seriesMap.get(pair).lowSeedId = m.awayTeamId;
-    }
-    seriesMap.get(pair).matches.push(m);
-  }
-
-  const needGame3Domestic: any[] = [];
-  const needGame3CL: any[] = [];
-  const winnersHSL: string[] = [];
-  const winnersASL: string[] = [];
-  const winnersCL: string[] = [];
-
-  for (const data of seriesMap.values()) {
-    let highWins = 0, lowWins = 0;
-    for (const m of data.matches) {
-      if (m.status === 'COMPLETED') {
-        const winnerId = m.homeScore! > m.awayScore! ? m.homeTeamId : m.awayTeamId;
-        if (winnerId === data.highSeedId) highWins++; else lowWins++;
-      }
-    }
-    
-    if (highWins === 2) {
-      if (data.matchType === 'HSL_PLAYOFF') winnersHSL.push(data.highSeedId);
-      else if (data.matchType === 'ASL_PLAYOFF') winnersASL.push(data.highSeedId);
-      else winnersCL.push(data.highSeedId);
-    } else if (lowWins === 2) {
-      if (data.matchType === 'HSL_PLAYOFF') winnersHSL.push(data.lowSeedId);
-      else if (data.matchType === 'ASL_PLAYOFF') winnersASL.push(data.lowSeedId);
-      else winnersCL.push(data.lowSeedId);
-    } else if (data.matches.length === 2) { 
-      if (data.matchType === 'CHAMPIONS_LEAGUE') needGame3CL.push(data);
-      else needGame3Domestic.push(data);
-    }
-  }
-
-  let maxRound = Math.max(...playoffMatches.map(m => m.round));
-  const newMatches: any[] = [];
-
-  if (needGame3Domestic.length > 0 || needGame3CL.length > 0) {
-    if (needGame3Domestic.length > 0) {
-      maxRound++;
-      needGame3Domestic.forEach(s => newMatches.push({ seasonId: season.id, homeTeamId: s.highSeedId, awayTeamId: s.lowSeedId, status: 'SCHEDULED', matchType: s.matchType, playoffRound: currentStage, gameNumber: 3, round: maxRound, isOvertime: false }));
-    }
-    if (needGame3CL.length > 0) {
-      maxRound++;
-      needGame3CL.forEach(s => newMatches.push({ seasonId: season.id, homeTeamId: s.highSeedId, awayTeamId: s.lowSeedId, status: 'SCHEDULED', matchType: s.matchType, playoffRound: currentStage, gameNumber: 3, round: maxRound, isOvertime: false }));
-    }
-    await prisma.match.createMany({ data: newMatches });
-    revalidatePath('/');
-    return;
-  }
-
-  if (currentStage === 'FINAL') {
-    await prisma.season.update({ where: { id: season.id }, data: { phase: 'AWARDS' } });
-    revalidatePath('/');
-    return;
-  }
-
-  const standings = await getStandings(season.id);
-  const getSortedWinners = (winnerIds: string[], leagueData: any[]) => {
-    return winnerIds.map(id => leagueData.find(t => t.id === id)).sort((a, b) => leagueData.indexOf(a) - leagueData.indexOf(b));
-  };
-
-  const nextStage = currentStage === 'QF' ? 'SF' : 'FINAL';
-  const hslNext = getSortedWinners(winnersHSL, standings.hsl);
-  const aslNext = getSortedWinners(winnersASL, standings.asl);
-  const clNext = getSortedWinners(winnersCL, standings.all);
-
-  const domGame1Round = maxRound + 1;
-  const clGame1Round = maxRound + 2;
-  const domGame2Round = maxRound + 3;
-  const clGame2Round = maxRound + 4;
-
-  const createMatch = (high: any, low: any, type: string, gameNum: number, targetRound: number) => {
-    if (!high || !low) return;
-    newMatches.push({ seasonId: season.id, homeTeamId: gameNum === 1 ? high.id : low.id, awayTeamId: gameNum === 1 ? low.id : high.id, status: 'SCHEDULED', matchType: type, playoffRound: nextStage, gameNumber: gameNum, round: targetRound, isOvertime: false });
-  };
-
-  if (nextStage === 'SF') {
-    createMatch(hslNext[0], hslNext[3], 'HSL_PLAYOFF', 1, domGame1Round);
-    createMatch(hslNext[1], hslNext[2], 'HSL_PLAYOFF', 1, domGame1Round);
-    createMatch(aslNext[0], aslNext[3], 'ASL_PLAYOFF', 1, domGame1Round);
-    createMatch(aslNext[1], aslNext[2], 'ASL_PLAYOFF', 1, domGame1Round);
-    createMatch(clNext[0], clNext[3], 'CHAMPIONS_LEAGUE', 1, clGame1Round);
-    createMatch(clNext[1], clNext[2], 'CHAMPIONS_LEAGUE', 1, clGame1Round);
-
-    createMatch(hslNext[0], hslNext[3], 'HSL_PLAYOFF', 2, domGame2Round);
-    createMatch(hslNext[1], hslNext[2], 'HSL_PLAYOFF', 2, domGame2Round);
-    createMatch(aslNext[0], aslNext[3], 'ASL_PLAYOFF', 2, domGame2Round);
-    createMatch(aslNext[1], aslNext[2], 'ASL_PLAYOFF', 2, domGame2Round);
-    createMatch(clNext[0], clNext[3], 'CHAMPIONS_LEAGUE', 2, clGame2Round);
-    createMatch(clNext[1], clNext[2], 'CHAMPIONS_LEAGUE', 2, clGame2Round);
-
-  } else if (nextStage === 'FINAL') {
-    createMatch(hslNext[0], hslNext[1], 'HSL_PLAYOFF', 1, domGame1Round);
-    createMatch(aslNext[0], aslNext[1], 'ASL_PLAYOFF', 1, domGame1Round);
-    createMatch(clNext[0], clNext[1], 'CHAMPIONS_LEAGUE', 1, clGame1Round);
-
-    createMatch(hslNext[0], hslNext[1], 'HSL_PLAYOFF', 2, domGame2Round);
-    createMatch(aslNext[0], aslNext[1], 'ASL_PLAYOFF', 2, domGame2Round);
-    createMatch(clNext[0], clNext[1], 'CHAMPIONS_LEAGUE', 2, clGame2Round);
-  }
-
-  await prisma.match.createMany({ data: newMatches });
-  revalidatePath('/');
-}
-
-export async function distributeAwards() {
-  const season = await prisma.season.findFirst({ where: { phase: 'AWARDS' }, include: { matches: true } });
-  if (!season) return;
-
-  const standings = await getStandings(season.id);
-  const hslRegWinner = standings.hsl[0].id;
-  const aslRegWinner = standings.asl[0].id;
-
-  const finalMatches = season.matches.filter(m => m.playoffRound === 'FINAL' && m.status === 'COMPLETED');
-  const getSeriesWinner = (type: string) => {
-    const matches = finalMatches.filter(m => m.matchType === type);
-    if(matches.length === 0) return null;
-    let w1 = 0, w2 = 0;
-    const team1 = matches[0].homeTeamId;
-    const team2 = matches[0].awayTeamId;
-    
-    matches.forEach(m => {
-      const winnerId = m.homeScore! > m.awayScore! ? m.homeTeamId : m.awayTeamId;
-      if(winnerId === team1) w1++; else w2++;
+        const oldSeason = await tx.season.update({ where: { id: oldSeasonId }, data: { isActive: false }});
+        const nextSeasonNumber = parseInt(oldSeason.name.replace('Säsong ', '')) + 1 || 99;
+        await tx.season.create({ data: { name: `Säsong ${nextSeasonNumber}`, startDate: new Date(), isActive: true, phase: 'PRE_SEASON' }});
     });
-    return w1 === 2 ? team1 : (w2 === 2 ? team2 : null);
+
+    revalidatePath('/');
+    return { success: true };
+}
+
+function createBo5Matches(tA_id: string, tB_id: string, seasonId: string, matchType: string, playoffRound: string, roundSlot: number) {
+    const matches = [];
+    for (let i = 1; i <= 5; i++) {
+        const isTeamAHome = i === 1 || i === 2 || i === 5;
+        matches.push({ seasonId, round: roundSlot, matchType, playoffRound, gameNumber: i, homeTeamId: isTeamAHome ? tA_id : tB_id, awayTeamId: isTeamAHome ? tB_id : tA_id, status: 'SCHEDULED' });
+    }
+    return matches;
+}
+
+export async function initiatePlayoffs(seasonId: string) {
+    const existingPlayoff = await prisma.match.count({ where: { seasonId, matchType: 'PLAYOFF' } });
+    if (existingPlayoff > 0) throw new Error("Slutspelet är redan initierat.");
+
+    const { elit, superettan } = await getCalculatedTables(seasonId);
+    if (elit.length < 14 || superettan.length < 14) throw new Error("För få lag för att generera ett komplett slutspel.");
+
+    let tbdTeam = await prisma.team.findFirst({ where: { name: 'TBD' } });
+    let matchesToCreate: any[] = [];
+    
+    const elitMatchups = [ [0, 7], [3, 4], [2, 5], [1, 6] ]; 
+    for (let slot = 0; slot < 4; slot++) {
+        const tA = elit[elitMatchups[slot][0]]; 
+        const tB = elit[elitMatchups[slot][1]];
+        matchesToCreate.push(...createBo5Matches(tA.id, tB.id, seasonId, 'PLAYOFF', 'QF', slot + 1));
+    }
+
+    const tbdRounds = [ { round: 'SF', slots: 2 }, { round: 'FINAL', slots: 1 } ];
+    tbdRounds.forEach(r => { for(let s=1; s<=r.slots; s++){ matchesToCreate.push(...createBo5Matches(tbdTeam!.id, tbdTeam!.id, seasonId, 'PLAYOFF', r.round, s)); } });
+
+    matchesToCreate.push(...createBo5Matches(superettan[1].id, elit[12].id, seasonId, 'QUALIFIER', 'KVAL_1', 1));
+    matchesToCreate.push(...createBo5Matches(superettan[2].id, elit[11].id, seasonId, 'QUALIFIER', 'KVAL_2', 2));
+    matchesToCreate.push(...createBo5Matches(superettan[12].id, superettan[13].id, seasonId, 'BOTTOM_BATTLE', 'BOTTENSTRID', 1));
+
+    await prisma.match.createMany({ data: matchesToCreate });
+    await prisma.season.update({ where: { id: seasonId }, data: { phase: 'PLAYOFFS' } });
+
+    revalidatePath('/');
+    return { success: true };
+}
+
+export async function generateRegularSeasonSchedule(seasonId: string) {
+  const season = await prisma.season.findUnique({ where: { id: seasonId } })
+  if (!season) throw new Error("Säsong hittades inte")
+
+  const existingMatches = await prisma.match.count({ where: { seasonId, matchType: 'REGULAR' } })
+  if (existingMatches > 0) throw new Error("Spelschema finns redan skapat.")
+
+  const allTeams = await prisma.team.findMany({ where: { isActive: true } });
+  
+  let tbdTeam = await prisma.team.findUnique({ where: { name: 'TBD' } });
+  if (!tbdTeam) { tbdTeam = await prisma.team.create({ data: { name: 'TBD', division: 'NONE', currentElo: 0, peakElo: 0, isActive: false, primaryColor: '#f8fafc' } }); }
+
+  const elitserien = allTeams.filter(t => t.division === 'ELITSERIEN' && t.name !== 'TBD');
+  const superettan = allTeams.filter(t => t.division === 'SUPERETTAN' && t.name !== 'TBD');
+  let matchesToCreate: any[] = []
+  
+  const generateDivisionSchedule = (teams: any[]) => {
+      const divisionTeams = [...teams];
+      if (divisionTeams.length % 2 !== 0) divisionTeams.push({ id: 'BYE_REGULAR', name: 'BYE' } as any);
+
+      const numTeams = divisionTeams.length
+      const numRounds = numTeams - 1
+      const halfSize = numTeams / 2
+
+      for (let round = 0; round < numRounds; round++) {
+        for (let i = 0; i < halfSize; i++) {
+          const home = divisionTeams[i]
+          const away = divisionTeams[numTeams - 1 - i]
+          if (home.id !== 'BYE_REGULAR' && away.id !== 'BYE_REGULAR') {
+            matchesToCreate.push({ homeTeamId: home.id, awayTeamId: away.id, seasonId: season.id, round: round + 1, matchType: 'REGULAR', status: 'SCHEDULED' })
+            matchesToCreate.push({ homeTeamId: away.id, awayTeamId: home.id, seasonId: season.id, round: round + 1 + numRounds, matchType: 'REGULAR', status: 'SCHEDULED' })
+          }
+        }
+        divisionTeams.splice(1, 0, divisionTeams.pop() as any)
+      }
   };
+  generateDivisionSchedule(elitserien);
+  generateDivisionSchedule(superettan);
 
-  const hslPlayoffWinner = getSeriesWinner('HSL_PLAYOFF');
-  const aslPlayoffWinner = getSeriesWinner('ASL_PLAYOFF');
-  const clWinner = getSeriesWinner('CHAMPIONS_LEAGUE');
+  const clTeams = allTeams.filter(t => t.isActive && t.name !== 'TBD');
+  const shuffledClTeams = clTeams.sort(() => Math.random() - 0.5); 
 
-  const trophiesToCreate = [];
-
-  trophiesToCreate.push({ seasonId: season.id, teamId: hslRegWinner, name: "HSL Grundserievinnare", type: "REGULAR_HSL", imagePath: "/prices/HSLtrophy1.png" });
-  trophiesToCreate.push({ seasonId: season.id, teamId: aslRegWinner, name: "ASL Grundserievinnare", type: "REGULAR_ASL", imagePath: "/prices/ASLtrophy1.png" });
-
-  if(hslPlayoffWinner) trophiesToCreate.push({ seasonId: season.id, teamId: hslPlayoffWinner, name: "HSL Slutspelsmästare", type: "PLAYOFF_HSL", imagePath: "/prices/HSLtrophy2.png" });
-  if(aslPlayoffWinner) trophiesToCreate.push({ seasonId: season.id, teamId: aslPlayoffWinner, name: "ASL Slutspelsmästare", type: "PLAYOFF_ASL", imagePath: "/prices/ASLtrophy2.png" });
-  if(clWinner) trophiesToCreate.push({ seasonId: season.id, teamId: clWinner, name: "Champions League Mästare", type: "CL", imagePath: "/prices/CLtrophy.png" });
-
-  if (hslRegWinner === hslPlayoffWinner && hslPlayoffWinner === clWinner) {
-    trophiesToCreate.push({ seasonId: season.id, teamId: hslRegWinner, name: "Tri-fecta Champion", type: "TRIFECTA", imagePath: "/prices/TRItrophy.png" });
-  } else if (aslRegWinner === aslPlayoffWinner && aslPlayoffWinner === clWinner) {
-    trophiesToCreate.push({ seasonId: season.id, teamId: aslRegWinner, name: "Tri-fecta Champion", type: "TRIFECTA", imagePath: "/prices/TRItrophy.png" });
+  let clTeamIndex = 0;
+  const numByes = 32 - clTeams.length; 
+  const byeSlots: number[] = [];
+  if (numByes > 0) {
+      const step = 16 / numByes;
+      for (let i = 0; i < numByes; i++) { byeSlots.push(Math.floor(i * step) + 1); }
   }
 
-  const allTeams = await prisma.team.findMany();
-  const eloSnapshots = allTeams.map(t => ({
-    seasonId: season.id,
-    teamId: t.id,
-    finalElo: t.currentElo
-  }));
-
-  await prisma.$transaction([
-    prisma.trophy.createMany({ data: trophiesToCreate }),
-    prisma.seasonResult.createMany({ data: eloSnapshots }),
-    prisma.season.update({ where: { id: season.id }, data: { phase: 'OFF_SEASON' } })
-  ]);
-
-  revalidatePath('/');
-}
-
-export async function startNextSeason() {
-  const oldSeason = await prisma.season.findFirst({ where: { phase: 'OFF_SEASON' } });
-  if (!oldSeason) return;
-
-  const match = oldSeason.name.match(/\d+/);
-  const nextNumber = match ? parseInt(match[0]) + 1 : 2;
-
-  await prisma.$transaction([
-    prisma.season.update({ where: { id: oldSeason.id }, data: { phase: 'ARCHIVED' } }),
-    prisma.season.create({ data: { name: `Säsong ${nextNumber}`, phase: 'PRE_SEASON' } })
-  ]);
+  const ro32Matches: any[] = []; 
   
-  revalidatePath('/');
-}
-
-export async function updateTeamColors(teamId: string, primaryColor: string, secondaryColor: string) {
-  await prisma.team.update({
-    where: { id: teamId },
-    data: { primaryColor, secondaryColor }
+  for (let slot = 1; slot <= 16; slot++) {
+      let tA, tB;
+      if (byeSlots.includes(slot) && clTeamIndex < shuffledClTeams.length) {
+          tA = shuffledClTeams[clTeamIndex++]; tB = tbdTeam; 
+          ro32Matches.push({ seasonId: season.id, round: slot, matchType: 'CL', playoffRound: 'RO32', gameNumber: 1, homeTeamId: tA.id, awayTeamId: tB.id, status: 'COMPLETED', homePoints: 1, awayPoints: 0, isSuddenDeath: false });
+          ro32Matches.push({ seasonId: season.id, round: slot, matchType: 'CL', playoffRound: 'RO32', gameNumber: 2, homeTeamId: tB.id, awayTeamId: tA.id, status: 'COMPLETED', homePoints: 0, awayPoints: 1, isSuddenDeath: false });
+      } else if (clTeamIndex < shuffledClTeams.length - 1) {
+          tA = shuffledClTeams[clTeamIndex++]; tB = shuffledClTeams[clTeamIndex++];
+          let home1 = tA, away1 = tB;
+          if (tA.currentElo > tB.currentElo) { home1 = tB; away1 = tA; } 
+          ro32Matches.push({ seasonId: season.id, round: slot, matchType: 'CL', playoffRound: 'RO32', gameNumber: 1, homeTeamId: home1.id, awayTeamId: away1.id, status: 'SCHEDULED' });
+          ro32Matches.push({ seasonId: season.id, round: slot, matchType: 'CL', playoffRound: 'RO32', gameNumber: 2, homeTeamId: away1.id, awayTeamId: home1.id, status: 'SCHEDULED' });
+      }
+  }
+  
+  const futureMatches: any[] = []; 
+  [ { round: 'RO16', slots: 8, games: 2 }, { round: 'QF', slots: 4, games: 2 }, { round: 'SF', slots: 2, games: 2 } ].forEach(r => {
+      for(let s=1; s<=r.slots; s++){ for(let g=1; g<=r.games; g++){ futureMatches.push({ seasonId: season.id, round: s, matchType: 'CL', playoffRound: r.round, gameNumber: g, homeTeamId: tbdTeam!.id, awayTeamId: tbdTeam!.id, status: 'SCHEDULED' }); } }
   });
+  for(let g=1; g<=5; g++){ futureMatches.push({ seasonId: season.id, round: 1, matchType: 'CL', playoffRound: 'FINAL', gameNumber: g, homeTeamId: tbdTeam!.id, awayTeamId: tbdTeam!.id, status: 'SCHEDULED' }); }
+
+  await prisma.match.createMany({ data: [...matchesToCreate, ...ro32Matches, ...futureMatches] });
+
+  const byeRecords = await prisma.match.findMany({ where: { seasonId: season.id, matchType: 'CL', playoffRound: 'RO32', awayTeamId: tbdTeam.id } });
+  for (const bm of byeRecords) { await checkAndAdvanceTournament(bm, season.id); }
+
+  await prisma.season.update({ where: { id: seasonId }, data: { phase: 'REGULAR_SEASON' } });
   revalidatePath('/');
-}
-
-// NY FUNKTION: EXPORTERA HELA DATABASEN (BACKUP)
-export async function exportDatabase() {
-  const teams = await prisma.team.findMany({ include: { trophies: true, seasonResults: true } });
-  const seasons = await prisma.season.findMany({ include: { matches: true } });
-  
-  const backupData = {
-    timestamp: new Date().toISOString(),
-    version: "1.0",
-    data: { teams, seasons }
-  };
-
-  return JSON.stringify(backupData, null, 2);
+  return { success: true, count: matchesToCreate.length }
 }
